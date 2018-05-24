@@ -16,12 +16,12 @@ podTemplate(
     containers: [
         containerTemplate(
             name: 'jnlp',
-            image: 'gcr.io/omise-go/jenkins-slave',
+            image: 'jenkins/jnlp-slave:3.19-1-alpine',
             args: '${computer.jnlpmac} ${computer.name}',
-            resourceRequestCpu: '200m',
-            resourceLimitCpu: '500m',
-            resourceRequestMemory: '128Mi',
-            resourceLimitMemory: '512Mi',
+            resourceRequestCpu: '500m',
+            resourceLimitCpu: '1000m',
+            resourceRequestMemory: '512Mi',
+            resourceLimitMemory: '1024Mi',
         ),
         containerTemplate(
             name: 'postgresql',
@@ -30,6 +30,13 @@ podTemplate(
             resourceLimitCpu: '800m',
             resourceRequestMemory: '512Mi',
             resourceLimitMemory: '1024Mi',
+            ports: [
+                portMapping(
+                    name: 'postgresql',
+                    containerPort: 5432,
+                    hostPort: 5432
+                )
+            ]
         ),
     ],
     volumes: [
@@ -41,95 +48,34 @@ podTemplate(
         Random random = new Random()
         def tmpDir = pwd(tmp: true)
 
-        def project = 'omisego'
+        def project = 'gcr.io/omise-go'
         def appName = 'ewallet'
         def imageName = "${project}/${appName}"
+        def releaseVersion = '0.1.0-beta'
 
         def nodeIP = getNodeIP()
         def gitCommit
 
-        stage('Checkout') {
+        stage('Pull') {
             checkout scm
-        }
-
-        stage('Build') {
             gitCommit = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-            sh("docker build --pull . -t ${imageName}:${gitCommit}")
         }
 
         stage('Test') {
-            container('postgresql') {
-                sh("pg_isready -t 60 -h localhost -p 5432")
-            }
-
-            sh(
-                """
-                docker run \
-                    --rm \
-                    --entrypoint /bin/execlineb \
-                    -e DATABASE_URL="postgresql://postgres@${nodeIP}:5432/ewallet_${gitCommit}_ewallet" \
-                    -e LOCAL_LEDGER_DATABASE_URL="postgresql://postgres@${nodeIP}:5432/ewallet_${gitCommit}_local_ledger" \
-                    ${imageName}:${gitCommit} \
-                    -P -c " \
-                        s6-setuidgid ewallet \
-                        s6-env HOME=/tmp/ewallet \
-                        s6-env MIX_ENV=test \
-                        cd /app \
-                        mix do format --check-formatted, credo, ecto.create, ecto.migrate, test \
-                    " \
-                """.stripIndent()
-            )
-        }
-
-        if (env.BRANCH_NAME == 'develop') {
-            stage('Push') {
-                withCredentials([file(credentialsId: 'docker', variable: 'DOCKER_CONFIG')]) {
-                    def configDir = sh(script: "dirname ${DOCKER_CONFIG}", returnStdout: true).trim()
-                    sh("docker --config=${configDir} tag ${imageName}:${gitCommit} ${imageName}:latest")
-                    sh("docker --config=${configDir} push ${imageName}:${gitCommit}")
-                    sh("docker --config=${configDir} push ${imageName}:latest")
-                }
-            }
-
-            stage('Deploy') {
-                dir("${tmpDir}/deploy") {
-                    checkout([
-                        $class: 'GitSCM',
-                        branches: [[name: '*/master']],
-                        userRemoteConfigs: [
-                            [
-                                url: 'ssh://git@github.com/omisego/kube.git',
-                                credentialsId: 'github',
-                            ],
-                        ]
-                    ])
-
-                    sh("sed -i.bak 's#${imageName}:latest#${imageName}:${gitCommit}#' staging/k8s/ewallet/deployment.yaml")
-                    sh("kubectl apply -f staging/k8s/ewallet/deployment.yaml")
-                    sh("kubectl rollout status --namespace=staging deployment/ewallet")
-
-                    def podID = getPodID('--namespace=staging -l app=ewallet')
-
-                    sh(
-                        """
-                        kubectl exec ${podID} --namespace=staging -- \
-                            /bin/execlineb -P -c " \
-                                s6-setuidgid ewallet \
-                                s6-env HOME=/tmp/ewallet \
-                                mix ecto.migrate \
-                            " \
-                        """.stripIndent()
-                    )
-                }
-            }
-        } else if (env.BRANCH_NAME == 'master') {
-            stage('Push') {
-                withCredentials([file(credentialsId: 'docker', variable: 'DOCKER_CONFIG')]) {
-                    def configDir = sh(script: "dirname ${DOCKER_CONFIG}", returnStdout: true).trim()
-                    sh("docker --config=${configDir} tag ${imageName}:${gitCommit} ${imageName}:stable")
-                    sh("docker --config=${configDir} push ${imageName}:${gitCommit}")
-                    sh("docker --config=${configDir} push ${imageName}:stable")
-                }
+            withDockerContainer(
+                image: 'elixir:1.6.5-alpine',
+                args: [
+                    "-v .:/build:ro",
+                    "-e MIX_ENV=test",
+                    "-e DATABASE_URL=postgresql://postgres@${nodeIP}:5432/ewallet_${gitCommit}_ewallet",
+                    "-e LOCAL_LEDGER_DATABASE_URL=postgresql://postgres@${nodeIP}:5432/ewallet_${gitCommit}_local_ledger",
+                ].join(' ')
+            ) {
+                sh('mix local.hex --force')
+                sh('mix local.rebar --force')
+                sh('mix do format --check-formatted, credo')
+                sh('mix do ecto.create, ecto.migrate')
+                sh('mix test')
             }
         }
     }
